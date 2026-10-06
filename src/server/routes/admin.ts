@@ -1,88 +1,45 @@
-import express, { Request, Response } from 'express';
+import { Hono } from 'hono';
 import bcrypt from 'bcryptjs';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
 import crypto from 'crypto';
-import {
-  db,
-  Product,
-  Category,
-  Order,
-  ProductAccess,
-  SiteSettings,
-  PUBLIC_UPLOADS_DIR,
-  PRIVATE_FILES_DIR,
-  PRIVATE_SCREENSHOTS_DIR,
-} from '../db.js';
-import { requireAdmin, signAdminToken, AuthenticatedRequest } from '../auth.js';
+import { repo, readFile, saveFile, Product, Category, ProductAccess } from '../db.js';
+import { requireAdmin, signAdminToken, AdminEnv } from '../auth.js';
 
-export const adminRouter = express.Router();
+export const adminRouter = new Hono<AdminEnv>();
 
-// Multer storage for public product images
-const imageStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, PUBLIC_UPLOADS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, `prod-img-${uniqueSuffix}${ext}`);
-  },
-});
+const ALLOWED_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
+// Function request bodies are capped at 6MB, so keep uploads comfortably below that
+const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
 
-const uploadImage = multer({
-  storage: imageStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    const allowed = ['.jpg', '.jpeg', '.png', '.webp'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only JPG, JPEG, PNG, and WEBP image files are allowed'));
-    }
-  },
-});
+function extname(fileName: string): string {
+  const dot = fileName.lastIndexOf('.');
+  return dot >= 0 ? fileName.slice(dot).toLowerCase() : '';
+}
 
-// Multer storage for private digital product files
-const productFileStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, PRIVATE_FILES_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const uniquePrefix = Date.now() + '-';
-    cb(null, `${uniquePrefix}${safeName}`);
-  },
-});
-
-const uploadProductFile = multer({
-  storage: productFileStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-});
+async function readJson(c: { req: { json: () => Promise<any> } }): Promise<any> {
+  return c.req.json().catch(() => ({}));
+}
 
 // -------------------------------------------------------------
 // 1. ADMIN AUTHENTICATION
 // -------------------------------------------------------------
-adminRouter.post('/login', (req: Request, res: Response) => {
-  const { email, password } = req.body;
+adminRouter.post('/login', async (c) => {
+  const { email, password } = await readJson(c);
 
   if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+    return c.json({ error: 'Email and password are required' }, 400);
   }
 
-  const admins = db.get('admin_users');
+  const admins = await repo.adminUsers.all();
   const normalizedEmail = email.trim().toLowerCase();
   const admin = admins.find((a) => a.email.toLowerCase() === normalizedEmail);
 
   if (!admin) {
-    return res.status(401).json({ error: 'Invalid admin credentials' });
+    return c.json({ error: 'Invalid admin credentials' }, 401);
   }
 
   const isMatch = bcrypt.compareSync(password, admin.password_hash);
   if (!isMatch) {
-    return res.status(401).json({ error: 'Invalid admin credentials' });
+    return c.json({ error: 'Invalid admin credentials' }, 401);
   }
 
   const token = signAdminToken({
@@ -91,7 +48,7 @@ adminRouter.post('/login', (req: Request, res: Response) => {
     role: admin.role,
   });
 
-  return res.json({
+  return c.json({
     token,
     admin: {
       id: admin.id,
@@ -102,14 +59,13 @@ adminRouter.post('/login', (req: Request, res: Response) => {
   });
 });
 
-adminRouter.get('/me', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const admins = db.get('admin_users');
-  const admin = admins.find((a) => a.id === req.admin?.adminId);
+adminRouter.get('/me', requireAdmin, async (c) => {
+  const admin = await repo.adminUsers.get(c.get('admin').adminId);
   if (!admin) {
-    return res.status(404).json({ error: 'Admin not found' });
+    return c.json({ error: 'Admin not found' }, 404);
   }
 
-  return res.json({
+  return c.json({
     admin: {
       id: admin.id,
       email: admin.email,
@@ -122,9 +78,8 @@ adminRouter.get('/me', requireAdmin, (req: AuthenticatedRequest, res: Response) 
 // -------------------------------------------------------------
 // 2. DASHBOARD STATS
 // -------------------------------------------------------------
-adminRouter.get('/stats', requireAdmin, (_req: Request, res: Response) => {
-  const products = db.get('products');
-  const orders = db.get('orders');
+adminRouter.get('/stats', requireAdmin, async (c) => {
+  const [products, orders] = await Promise.all([repo.products.all(), repo.orders.all()]);
 
   const pendingPayments = orders.filter((o) => o.payment_status === 'PENDING').length;
   const verifiedPayments = orders.filter((o) => o.payment_status === 'VERIFIED').length;
@@ -165,7 +120,7 @@ adminRouter.get('/stats', requireAdmin, (_req: Request, res: Response) => {
     .sort((a, b) => b.count - a.count)
     .slice(0, 5);
 
-  return res.json({
+  return c.json({
     totalProducts: products.length,
     totalOrders: orders.length,
     pendingPayments,
@@ -182,45 +137,61 @@ adminRouter.get('/stats', requireAdmin, (_req: Request, res: Response) => {
 // -------------------------------------------------------------
 // 3. FILE UPLOADS (IMAGES & PRIVATE PRODUCT ASSETS)
 // -------------------------------------------------------------
-adminRouter.post('/upload-image', requireAdmin, uploadImage.single('image'), (req: Request, res: Response) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No image file uploaded' });
+adminRouter.post('/upload-image', requireAdmin, async (c) => {
+  const body = await c.req.parseBody();
+  const file = body.image instanceof File ? body.image : null;
+  if (!file) {
+    return c.json({ error: 'No image file uploaded' }, 400);
   }
 
-  const imageUrl = `/api/uploads/images/${req.file.filename}`;
-  return res.json({
-    url: imageUrl,
-    filename: req.file.filename,
-    size: req.file.size,
+  const ext = extname(file.name);
+  if (!ALLOWED_IMAGE_EXTENSIONS.includes(ext)) {
+    return c.json({ error: 'Only JPG, JPEG, PNG, and WEBP image files are allowed' }, 400);
+  }
+  if (file.size > MAX_UPLOAD_SIZE) {
+    return c.json({ error: 'Image must be smaller than 5MB' }, 400);
+  }
+
+  const filename = `prod-img-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+  await saveFile('images', filename, await file.arrayBuffer(), file.type);
+
+  return c.json({
+    url: `/api/uploads/images/${filename}`,
+    filename,
+    size: file.size,
   });
 });
 
-adminRouter.post(
-  '/upload-product-file',
-  requireAdmin,
-  uploadProductFile.single('file'),
-  (req: Request, res: Response) => {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No product file uploaded' });
-    }
-
-    return res.json({
-      fileName: req.file.originalname,
-      filePath: req.file.filename, // Private storage filename
-      fileSize: req.file.size,
-    });
+adminRouter.post('/upload-product-file', requireAdmin, async (c) => {
+  const body = await c.req.parseBody();
+  const file = body.file instanceof File ? body.file : null;
+  if (!file) {
+    return c.json({ error: 'No product file uploaded' }, 400);
   }
-);
+  if (file.size > MAX_UPLOAD_SIZE) {
+    return c.json({ error: 'Product file must be smaller than 5MB' }, 400);
+  }
+
+  const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+  const filePath = `${Date.now()}-${safeName}`;
+  await saveFile('products', filePath, await file.arrayBuffer(), file.type || 'application/octet-stream');
+
+  return c.json({
+    fileName: file.name,
+    filePath, // Private storage filename
+    fileSize: file.size,
+  });
+});
 
 // -------------------------------------------------------------
 // 4. PRODUCT MANAGEMENT (CRUD)
 // -------------------------------------------------------------
-adminRouter.get('/products', requireAdmin, (_req: Request, res: Response) => {
-  const products = db.get('products');
-  return res.json({ products });
+adminRouter.get('/products', requireAdmin, async (c) => {
+  const products = await repo.products.all();
+  return c.json({ products });
 });
 
-adminRouter.post('/products', requireAdmin, (req: Request, res: Response) => {
+adminRouter.post('/products', requireAdmin, async (c) => {
   const {
     name,
     slug,
@@ -243,13 +214,12 @@ adminRouter.post('/products', requireAdmin, (req: Request, res: Response) => {
     product_file_size,
     product_file_path,
     digital_content,
-  } = req.body;
+  } = await readJson(c);
 
   if (!name || price === undefined) {
-    return res.status(400).json({ error: 'Product name and price are required' });
+    return c.json({ error: 'Product name and price are required' }, 400);
   }
 
-  const products = db.get('products');
   const now = new Date().toISOString();
 
   // Create clean slug
@@ -289,72 +259,66 @@ adminRouter.post('/products', requireAdmin, (req: Request, res: Response) => {
     updated_at: now,
   };
 
-  products.unshift(newProduct);
-  db.set('products', products);
+  await repo.products.put(newProduct);
 
-  return res.status(201).json({ product: newProduct });
+  return c.json({ product: newProduct }, 201);
 });
 
-adminRouter.put('/products/:id', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const products = db.get('products');
-  const index = products.findIndex((p) => p.id === id);
+adminRouter.put('/products/:id', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const existing = await repo.products.get(id);
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Product not found' });
+  if (!existing) {
+    return c.json({ error: 'Product not found' }, 404);
   }
 
-  const existing = products[index];
+  const body = await readJson(c);
   const now = new Date().toISOString();
 
   const updated: Product = {
     ...existing,
-    ...req.body,
+    ...body,
     id: existing.id,
-    price: req.body.price !== undefined ? Number(req.body.price) : existing.price,
+    created_at: existing.created_at,
+    price: body.price !== undefined ? Number(body.price) : existing.price,
     discount_price:
-      req.body.discount_price !== undefined
-        ? req.body.discount_price
-          ? Number(req.body.discount_price)
+      body.discount_price !== undefined
+        ? body.discount_price
+          ? Number(body.discount_price)
           : null
         : existing.discount_price,
     updated_at: now,
   };
 
-  products[index] = updated;
-  db.set('products', products);
+  await repo.products.put(updated);
 
-  return res.json({ product: updated });
+  return c.json({ product: updated });
 });
 
-adminRouter.delete('/products/:id', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const products = db.get('products');
-  const filtered = products.filter((p) => p.id !== id);
+adminRouter.delete('/products/:id', requireAdmin, async (c) => {
+  const removed = await repo.products.remove(c.req.param('id'));
 
-  if (filtered.length === products.length) {
-    return res.status(404).json({ error: 'Product not found' });
+  if (!removed) {
+    return c.json({ error: 'Product not found' }, 404);
   }
 
-  db.set('products', filtered);
-  return res.json({ success: true, message: 'Product deleted successfully' });
+  return c.json({ success: true, message: 'Product deleted successfully' });
 });
 
 // -------------------------------------------------------------
 // 5. CATEGORY MANAGEMENT
 // -------------------------------------------------------------
-adminRouter.get('/categories', requireAdmin, (_req: Request, res: Response) => {
-  const categories = db.get('categories');
-  return res.json({ categories });
+adminRouter.get('/categories', requireAdmin, async (c) => {
+  const categories = await repo.categories.all();
+  return c.json({ categories });
 });
 
-adminRouter.post('/categories', requireAdmin, (req: Request, res: Response) => {
-  const { name, slug, description, image_url, status } = req.body;
+adminRouter.post('/categories', requireAdmin, async (c) => {
+  const { name, slug, description, image_url, status } = await readJson(c);
   if (!name) {
-    return res.status(400).json({ error: 'Category name is required' });
+    return c.json({ error: 'Category name is required' }, 400);
   }
 
-  const categories = db.get('categories');
   const now = new Date().toISOString();
 
   const newCategory: Category = {
@@ -367,46 +331,41 @@ adminRouter.post('/categories', requireAdmin, (req: Request, res: Response) => {
     created_at: now,
   };
 
-  categories.push(newCategory);
-  db.set('categories', categories);
+  await repo.categories.put(newCategory);
 
-  return res.status(201).json({ category: newCategory });
+  return c.json({ category: newCategory }, 201);
 });
 
-adminRouter.put('/categories/:id', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const categories = db.get('categories');
-  const index = categories.findIndex((c) => c.id === id);
+adminRouter.put('/categories/:id', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const existing = await repo.categories.get(id);
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Category not found' });
+  if (!existing) {
+    return c.json({ error: 'Category not found' }, 404);
   }
 
-  categories[index] = { ...categories[index], ...req.body, id };
-  db.set('categories', categories);
+  const updated: Category = { ...existing, ...(await readJson(c)), id, created_at: existing.created_at };
+  await repo.categories.put(updated);
 
-  return res.json({ category: categories[index] });
+  return c.json({ category: updated });
 });
 
-adminRouter.delete('/categories/:id', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const categories = db.get('categories');
-  const filtered = categories.filter((c) => c.id !== id);
+adminRouter.delete('/categories/:id', requireAdmin, async (c) => {
+  const removed = await repo.categories.remove(c.req.param('id'));
 
-  if (filtered.length === categories.length) {
-    return res.status(404).json({ error: 'Category not found' });
+  if (!removed) {
+    return c.json({ error: 'Category not found' }, 404);
   }
 
-  db.set('categories', filtered);
-  return res.json({ success: true, message: 'Category deleted' });
+  return c.json({ success: true, message: 'Category deleted' });
 });
 
 // -------------------------------------------------------------
 // 6. ORDER & PAYMENT VERIFICATION
 // -------------------------------------------------------------
-adminRouter.get('/orders', requireAdmin, (req: Request, res: Response) => {
-  const { status, search } = req.query;
-  let orders = db.get('orders');
+adminRouter.get('/orders', requireAdmin, async (c) => {
+  const { status, search } = c.req.query();
+  let orders = await repo.orders.all();
 
   if (status && status !== 'All') {
     orders = orders.filter((o) => o.payment_status === status);
@@ -428,7 +387,7 @@ adminRouter.get('/orders', requireAdmin, (req: Request, res: Response) => {
   orders.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
   // Attach access status info for each order
-  const accessRecords = db.get('product_access');
+  const accessRecords = await repo.productAccess.all();
   const ordersWithAccess = orders.map((order) => {
     const access = accessRecords.find((a) => a.order_id === order.id);
     return {
@@ -437,80 +396,79 @@ adminRouter.get('/orders', requireAdmin, (req: Request, res: Response) => {
     };
   });
 
-  return res.json({ orders: ordersWithAccess });
+  return c.json({ orders: ordersWithAccess });
 });
 
-adminRouter.get('/orders/:id', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const orders = db.get('orders');
-  const order = orders.find((o) => o.id === id);
+adminRouter.get('/orders/:id', requireAdmin, async (c) => {
+  const order = await repo.orders.get(c.req.param('id'));
 
   if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
+    return c.json({ error: 'Order not found' }, 404);
   }
 
-  const access = db.get('product_access').find((a) => a.order_id === order.id);
-  const product = db.get('products').find((p) => p.id === order.product_id);
+  const [access, product] = await Promise.all([
+    repo.getAccessForOrder(order.id),
+    repo.products.get(order.product_id),
+  ]);
 
-  return res.json({ order, access, product });
+  return c.json({ order, access, product });
 });
 
 // Securely view payment screenshot proof (Only authorized admin can access)
-adminRouter.get('/orders/:id/screenshot', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const orders = db.get('orders');
-  const order = orders.find((o) => o.id === id);
+adminRouter.get('/orders/:id/screenshot', requireAdmin, async (c) => {
+  const order = await repo.orders.get(c.req.param('id'));
 
   if (!order || !order.payment_screenshot_path) {
-    return res.status(404).json({ error: 'Payment screenshot not found for this order' });
+    return c.json({ error: 'Payment screenshot not found for this order' }, 404);
   }
 
-  const filePath = path.join(PRIVATE_SCREENSHOTS_DIR, order.payment_screenshot_path);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'Screenshot file not found on disk' });
+  const file = await readFile('screenshots', order.payment_screenshot_path);
+  if (!file) {
+    return c.json({ error: 'Screenshot file not found in storage' }, 404);
   }
 
-  return res.sendFile(filePath);
+  return new Response(file.data, {
+    headers: {
+      'Content-Type': String(file.metadata.contentType || 'application/octet-stream'),
+      'Cache-Control': 'private, no-store',
+    },
+  });
 });
 
 // VERIFY PAYMENT
-adminRouter.post('/orders/:id/verify', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const { id } = req.params;
-  const orders = db.get('orders');
-  const index = orders.findIndex((o) => o.id === id);
+adminRouter.post('/orders/:id/verify', requireAdmin, async (c) => {
+  const order = await repo.orders.get(c.req.param('id'));
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Order not found' });
+  if (!order) {
+    return c.json({ error: 'Order not found' }, 404);
   }
 
-  const order = orders[index];
   const now = new Date().toISOString();
-  const settings = db.get('settings');
+  const settings = await repo.getSettings();
 
   // 1. Update order status
   order.payment_status = 'VERIFIED';
   order.verified_at = now;
-  order.verified_by = req.admin?.email || 'admin';
+  order.verified_by = c.get('admin')?.email || 'admin';
   order.rejected_at = undefined;
   order.rejected_by = undefined;
   order.rejection_reason = undefined;
   order.updated_at = now;
 
-  orders[index] = order;
-  db.set('orders', orders);
+  await repo.orders.put(order);
 
   // 2. Create or update product access record
-  const accessRecords = db.get('product_access');
-  const existingAccessIndex = accessRecords.findIndex((a) => a.order_id === order.id);
+  const existingAccess = await repo.getAccessForOrder(order.id);
 
   const accessToken = crypto.randomBytes(32).toString('hex');
   const expirationDays = settings.delivery.access_expiration_days || 365;
   const expiresAt = new Date(Date.now() + expirationDays * 24 * 60 * 60 * 1000).toISOString();
 
-  if (existingAccessIndex >= 0) {
-    accessRecords[existingAccessIndex].access_token = accessToken;
-    accessRecords[existingAccessIndex].revoked_at = undefined;
-    accessRecords[existingAccessIndex].expires_at = expiresAt;
+  if (existingAccess) {
+    existingAccess.access_token = accessToken;
+    existingAccess.revoked_at = undefined;
+    existingAccess.expires_at = expiresAt;
+    await repo.productAccess.put(existingAccess);
   } else {
     const newAccess: ProductAccess = {
       id: `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -523,9 +481,8 @@ adminRouter.post('/orders/:id/verify', requireAdmin, (req: AuthenticatedRequest,
       expires_at: expiresAt,
       created_at: now,
     };
-    accessRecords.push(newAccess);
+    await repo.productAccess.put(newAccess);
   }
-  db.set('product_access', accessRecords);
 
   // Simulated Email Notification
   console.log(`[EMAIL NOTIFICATION DISPATCHED]
@@ -533,7 +490,7 @@ To: ${order.customer_email}
 Subject: Your Digital Product Is Ready - Order #${order.id}
 Body: Hello ${order.customer_name}, Your payment has been successfully verified! Order: ${order.id}, Product: ${order.product_name}.`);
 
-  return res.json({
+  return c.json({
     success: true,
     message: 'Payment verified and secure product access granted',
     order,
@@ -541,37 +498,32 @@ Body: Hello ${order.customer_name}, Your payment has been successfully verified!
 });
 
 // REJECT PAYMENT
-adminRouter.post('/orders/:id/reject', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const { id } = req.params;
-  const { reason } = req.body;
-  const orders = db.get('orders');
-  const index = orders.findIndex((o) => o.id === id);
+adminRouter.post('/orders/:id/reject', requireAdmin, async (c) => {
+  const { reason } = await readJson(c);
+  const order = await repo.orders.get(c.req.param('id'));
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Order not found' });
+  if (!order) {
+    return c.json({ error: 'Order not found' }, 404);
   }
 
-  const order = orders[index];
   const now = new Date().toISOString();
 
   order.payment_status = 'REJECTED';
   order.rejected_at = now;
-  order.rejected_by = req.admin?.email || 'admin';
+  order.rejected_by = c.get('admin')?.email || 'admin';
   order.rejection_reason = reason || 'Payment proof could not be verified against bank statements.';
   order.updated_at = now;
 
-  orders[index] = order;
-  db.set('orders', orders);
+  await repo.orders.put(order);
 
   // Revoke any existing access record if any
-  const accessRecords = db.get('product_access');
-  const accessIndex = accessRecords.findIndex((a) => a.order_id === order.id);
-  if (accessIndex >= 0) {
-    accessRecords[accessIndex].revoked_at = now;
-    db.set('product_access', accessRecords);
+  const access = await repo.getAccessForOrder(order.id);
+  if (access) {
+    access.revoked_at = now;
+    await repo.productAccess.put(access);
   }
 
-  return res.json({
+  return c.json({
     success: true,
     message: 'Payment rejected',
     order,
@@ -579,61 +531,54 @@ adminRouter.post('/orders/:id/reject', requireAdmin, (req: AuthenticatedRequest,
 });
 
 // REVOKE ACCESS
-adminRouter.post('/orders/:id/revoke-access', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const accessRecords = db.get('product_access');
-  const access = accessRecords.find((a) => a.order_id === id);
+adminRouter.post('/orders/:id/revoke-access', requireAdmin, async (c) => {
+  const access = await repo.getAccessForOrder(c.req.param('id'));
 
   if (!access) {
-    return res.status(404).json({ error: 'No active access record found for this order' });
+    return c.json({ error: 'No active access record found for this order' }, 404);
   }
 
   access.revoked_at = new Date().toISOString();
-  db.set('product_access', accessRecords);
+  await repo.productAccess.put(access);
 
-  return res.json({ success: true, message: 'Product access revoked successfully' });
+  return c.json({ success: true, message: 'Product access revoked successfully' });
 });
 
 // RESTORE ACCESS
-adminRouter.post('/orders/:id/restore-access', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const accessRecords = db.get('product_access');
-  const access = accessRecords.find((a) => a.order_id === id);
+adminRouter.post('/orders/:id/restore-access', requireAdmin, async (c) => {
+  const access = await repo.getAccessForOrder(c.req.param('id'));
 
   if (!access) {
-    return res.status(404).json({ error: 'No access record found for this order' });
+    return c.json({ error: 'No access record found for this order' }, 404);
   }
 
   access.revoked_at = undefined;
-  db.set('product_access', accessRecords);
+  await repo.productAccess.put(access);
 
-  return res.json({ success: true, message: 'Product access restored successfully' });
+  return c.json({ success: true, message: 'Product access restored successfully' });
 });
 
 // UPDATE INTERNAL ORDER NOTES
-adminRouter.patch('/orders/:id/notes', requireAdmin, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { notes } = req.body;
-  const orders = db.get('orders');
-  const order = orders.find((o) => o.id === id);
+adminRouter.patch('/orders/:id/notes', requireAdmin, async (c) => {
+  const { notes } = await readJson(c);
+  const order = await repo.orders.get(c.req.param('id'));
 
   if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
+    return c.json({ error: 'Order not found' }, 404);
   }
 
   order.internal_notes = notes || '';
   order.updated_at = new Date().toISOString();
-  db.set('orders', orders);
+  await repo.orders.put(order);
 
-  return res.json({ success: true, notes: order.internal_notes });
+  return c.json({ success: true, notes: order.internal_notes });
 });
 
 // -------------------------------------------------------------
 // 7. CUSTOMER MANAGEMENT
 // -------------------------------------------------------------
-adminRouter.get('/customers', requireAdmin, (_req: Request, res: Response) => {
-  const orders = db.get('orders');
-  const accessRecords = db.get('product_access');
+adminRouter.get('/customers', requireAdmin, async (c) => {
+  const orders = await repo.orders.all();
 
   const customerMap = new Map<string, any>();
 
@@ -672,33 +617,34 @@ adminRouter.get('/customers', requireAdmin, (_req: Request, res: Response) => {
     (a, b) => new Date(b.latest_order).getTime() - new Date(a.latest_order).getTime()
   );
 
-  return res.json({ customers });
+  return c.json({ customers });
 });
 
 // -------------------------------------------------------------
 // 8. STORE SETTINGS (GENERAL, PAYMENTS, HOMEPAGE, DELIVERY)
 // -------------------------------------------------------------
-adminRouter.get('/settings', requireAdmin, (_req: Request, res: Response) => {
-  const settings = db.get('settings');
-  return res.json({ settings });
+adminRouter.get('/settings', requireAdmin, async (c) => {
+  const settings = await repo.getSettings();
+  return c.json({ settings });
 });
 
-adminRouter.put('/settings', requireAdmin, (req: Request, res: Response) => {
-  const current = db.get('settings');
+adminRouter.put('/settings', requireAdmin, async (c) => {
+  const body = await readJson(c);
+  const current = await repo.getSettings();
   const updated = {
     ...current,
-    ...req.body,
-    general: { ...current.general, ...(req.body.general || {}) },
+    ...body,
+    general: { ...current.general, ...(body.general || {}) },
     payments: {
       ...current.payments,
-      easypaisa: { ...current.payments.easypaisa, ...(req.body.payments?.easypaisa || {}) },
-      jazzcash: { ...current.payments.jazzcash, ...(req.body.payments?.jazzcash || {}) },
+      easypaisa: { ...current.payments.easypaisa, ...(body.payments?.easypaisa || {}) },
+      jazzcash: { ...current.payments.jazzcash, ...(body.payments?.jazzcash || {}) },
     },
-    delivery: { ...current.delivery, ...(req.body.delivery || {}) },
-    email: { ...current.email, ...(req.body.email || {}) },
-    homepage: { ...current.homepage, ...(req.body.homepage || {}) },
+    delivery: { ...current.delivery, ...(body.delivery || {}) },
+    email: { ...current.email, ...(body.email || {}) },
+    homepage: { ...current.homepage, ...(body.homepage || {}) },
   };
 
-  db.set('settings', updated);
-  return res.json({ settings: updated, message: 'Settings saved successfully' });
+  await repo.saveSettings(updated);
+  return c.json({ settings: updated, message: 'Settings saved successfully' });
 });

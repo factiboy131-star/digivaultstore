@@ -1,45 +1,18 @@
-import express, { Request, Response } from 'express';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
+import { Hono } from 'hono';
 import crypto from 'crypto';
-import {
-  db,
-  Product,
-  Order,
-  ProductAccess,
-  PRIVATE_SCREENSHOTS_DIR,
-  PRIVATE_FILES_DIR,
-} from '../db.js';
+import { repo, readFile, saveFile, Order } from '../db.js';
 import { signDownloadToken, verifyDownloadToken } from '../auth.js';
 
-export const publicRouter = express.Router();
+export const publicRouter = new Hono();
 
-// Multer storage for customer payment screenshots (Stored in PRIVATE directory!)
-const screenshotStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, PRIVATE_SCREENSHOTS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, `proof-${unique}${ext}`);
-  },
-});
+const ALLOWED_PROOF_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
+// Function request bodies are capped at 6MB, so keep uploads comfortably below that
+const MAX_PROOF_SIZE = 5 * 1024 * 1024;
 
-const uploadScreenshot = multer({
-  storage: screenshotStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    const allowed = ['.jpg', '.jpeg', '.png', '.webp'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only JPG, JPEG, PNG, or WEBP image proofs are accepted'));
-    }
-  },
-});
+function extname(fileName: string): string {
+  const dot = fileName.lastIndexOf('.');
+  return dot >= 0 ? fileName.slice(dot).toLowerCase() : '';
+}
 
 // Helper to generate formatted order ID like DP-20261006-8F32
 function generateOrderId(): string {
@@ -49,12 +22,28 @@ function generateOrderId(): string {
 }
 
 // -------------------------------------------------------------
+// 0. PUBLIC PRODUCT IMAGES
+// -------------------------------------------------------------
+publicRouter.get('/uploads/images/:name', async (c) => {
+  const file = await readFile('images', c.req.param('name'));
+  if (!file) {
+    return c.json({ error: 'Image not found' }, 404);
+  }
+  return new Response(file.data, {
+    headers: {
+      'Content-Type': String(file.metadata.contentType || 'application/octet-stream'),
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  });
+});
+
+// -------------------------------------------------------------
 // 1. PUBLIC STORE CONFIG & CATALOG
 // -------------------------------------------------------------
-publicRouter.get('/store-info', (_req: Request, res: Response) => {
-  const settings = db.get('settings');
+publicRouter.get('/store-info', async (c) => {
+  const settings = await repo.getSettings();
   // Strip any internal sensitive configs if any, return public view
-  return res.json({
+  return c.json({
     general: settings.general,
     payments: {
       easypaisa: {
@@ -74,14 +63,14 @@ publicRouter.get('/store-info', (_req: Request, res: Response) => {
   });
 });
 
-publicRouter.get('/categories', (_req: Request, res: Response) => {
-  const categories = db.get('categories').filter((c) => c.status === 'Active');
-  return res.json({ categories });
+publicRouter.get('/categories', async (c) => {
+  const categories = (await repo.categories.all()).filter((cat) => cat.status === 'Active');
+  return c.json({ categories });
 });
 
-publicRouter.get('/products', (req: Request, res: Response) => {
-  const { category, search, featured, bestseller } = req.query;
-  let products = db.get('products').filter((p) => p.status === 'Published');
+publicRouter.get('/products', async (c) => {
+  const { category, search, featured, bestseller } = c.req.query();
+  let products = (await repo.products.all()).filter((p) => p.status === 'Published');
 
   if (category) {
     products = products.filter(
@@ -118,12 +107,12 @@ publicRouter.get('/products', (req: Request, res: Response) => {
     };
   });
 
-  return res.json({ products: safeProducts });
+  return c.json({ products: safeProducts });
 });
 
-publicRouter.get('/products/:slugOrId', (req: Request, res: Response) => {
-  const { slugOrId } = req.params;
-  const products = db.get('products');
+publicRouter.get('/products/:slugOrId', async (c) => {
+  const slugOrId = c.req.param('slugOrId');
+  const products = await repo.products.all();
   const product = products.find(
     (p) =>
       p.status === 'Published' &&
@@ -131,13 +120,13 @@ publicRouter.get('/products/:slugOrId', (req: Request, res: Response) => {
   );
 
   if (!product) {
-    return res.status(404).json({ error: 'Product not found or unavailable' });
+    return c.json({ error: 'Product not found or unavailable' }, 404);
   }
 
   // Never expose raw private file paths
   const { product_file_path, digital_content, ...safeProduct } = product;
 
-  return res.json({
+  return c.json({
     product: {
       ...safeProduct,
       has_digital_file: Boolean(product_file_path),
@@ -149,72 +138,79 @@ publicRouter.get('/products/:slugOrId', (req: Request, res: Response) => {
 // -------------------------------------------------------------
 // 2. CHECKOUT & ORDER CREATION
 // -------------------------------------------------------------
-publicRouter.post(
-  '/orders/checkout',
-  uploadScreenshot.single('payment_screenshot'),
-  (req: Request, res: Response) => {
-    try {
-      const {
-        customer_name,
-        customer_email,
-        customer_phone,
-        product_id,
-        payment_method,
-        transaction_id,
-      } = req.body;
+publicRouter.post('/orders/checkout', async (c) => {
+  try {
+    const body = await c.req.parseBody();
+    const customer_name = typeof body.customer_name === 'string' ? body.customer_name : '';
+    const customer_email = typeof body.customer_email === 'string' ? body.customer_email : '';
+    const customer_phone = typeof body.customer_phone === 'string' ? body.customer_phone : '';
+    const product_id = typeof body.product_id === 'string' ? body.product_id : '';
+    const payment_method = typeof body.payment_method === 'string' ? body.payment_method : '';
+    const transaction_id = typeof body.transaction_id === 'string' ? body.transaction_id : '';
+    const screenshot = body.payment_screenshot instanceof File ? body.payment_screenshot : null;
 
-      if (!customer_name || !customer_email || !customer_phone) {
-        return res.status(400).json({ error: 'Customer contact details are required' });
-      }
+    if (!customer_name || !customer_email || !customer_phone) {
+      return c.json({ error: 'Customer contact details are required' }, 400);
+    }
 
-      if (!product_id) {
-        return res.status(400).json({ error: 'Product is required' });
-      }
+    if (!product_id) {
+      return c.json({ error: 'Product is required' }, 400);
+    }
 
-      if (!payment_method || !['EasyPaisa', 'JazzCash'].includes(payment_method)) {
-        return res.status(400).json({ error: 'Please select a valid payment method (EasyPaisa or JazzCash)' });
-      }
+    if (!payment_method || !['EasyPaisa', 'JazzCash'].includes(payment_method)) {
+      return c.json({ error: 'Please select a valid payment method (EasyPaisa or JazzCash)' }, 400);
+    }
 
-      if (!transaction_id || transaction_id.trim().length < 4) {
-        return res.status(400).json({ error: 'Please enter a valid Transaction ID (TID)' });
-      }
+    if (!transaction_id || transaction_id.trim().length < 4) {
+      return c.json({ error: 'Please enter a valid Transaction ID (TID)' }, 400);
+    }
 
-      if (!req.file) {
-        return res.status(400).json({ error: 'Payment screenshot proof is required' });
-      }
+    if (!screenshot) {
+      return c.json({ error: 'Payment screenshot proof is required' }, 400);
+    }
 
-      const products = db.get('products');
-      const product = products.find((p) => p.id === product_id && p.status === 'Published');
-      if (!product) {
-        return res.status(404).json({ error: 'Selected product is no longer available' });
-      }
+    const ext = extname(screenshot.name);
+    if (!ALLOWED_PROOF_EXTENSIONS.includes(ext)) {
+      return c.json({ error: 'Only JPG, JPEG, PNG, or WEBP image proofs are accepted' }, 400);
+    }
 
-      const finalPrice = product.discount_price !== null ? product.discount_price : product.price;
-      const orderId = generateOrderId();
-      const now = new Date().toISOString();
+    if (screenshot.size > MAX_PROOF_SIZE) {
+      return c.json({ error: 'Payment screenshot must be smaller than 5MB' }, 400);
+    }
 
-      const newOrder: Order = {
-        id: orderId,
-        customer_name: customer_name.trim(),
-        customer_email: customer_email.trim().toLowerCase(),
-        customer_phone: customer_phone.trim(),
-        product_id: product.id,
-        product_name: product.name,
-        product_price: product.price,
-        amount_paid: finalPrice,
-        payment_method: payment_method as any,
-        transaction_id: transaction_id.trim(),
-        payment_screenshot_path: req.file.filename,
-        payment_status: 'PENDING',
-        created_at: now,
-        updated_at: now,
-      };
+    const product = await repo.products.get(product_id);
+    if (!product || product.status !== 'Published') {
+      return c.json({ error: 'Selected product is no longer available' }, 404);
+    }
 
-      const orders = db.get('orders');
-      orders.unshift(newOrder);
-      db.set('orders', orders);
+    const screenshotName = `proof-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    await saveFile('screenshots', screenshotName, await screenshot.arrayBuffer(), screenshot.type);
 
-      return res.status(201).json({
+    const finalPrice = product.discount_price !== null ? product.discount_price : product.price;
+    const orderId = generateOrderId();
+    const now = new Date().toISOString();
+
+    const newOrder: Order = {
+      id: orderId,
+      customer_name: customer_name.trim(),
+      customer_email: customer_email.trim().toLowerCase(),
+      customer_phone: customer_phone.trim(),
+      product_id: product.id,
+      product_name: product.name,
+      product_price: product.price,
+      amount_paid: finalPrice,
+      payment_method: payment_method as any,
+      transaction_id: transaction_id.trim(),
+      payment_screenshot_path: screenshotName,
+      payment_status: 'PENDING',
+      created_at: now,
+      updated_at: now,
+    };
+
+    await repo.orders.put(newOrder);
+
+    return c.json(
+      {
         success: true,
         orderId: newOrder.id,
         message: 'Payment proof submitted successfully! Your order is pending verification.',
@@ -229,39 +225,36 @@ publicRouter.post(
           payment_status: newOrder.payment_status,
           created_at: newOrder.created_at,
         },
-      });
-    } catch (err: any) {
-      console.error('Checkout error:', err);
-      return res.status(500).json({ error: err.message || 'Failed to submit order' });
-    }
+      },
+      201
+    );
+  } catch (err: any) {
+    console.error('Checkout error:', err);
+    return c.json({ error: err.message || 'Failed to submit order' }, 500);
   }
-);
+});
 
 // -------------------------------------------------------------
 // 3. SECURE ORDER TRACKING & DIGITAL ACCESS
 // -------------------------------------------------------------
-publicRouter.get('/orders/track', (req: Request, res: Response) => {
-  const { orderId, email } = req.query;
+publicRouter.get('/orders/track', async (c) => {
+  const { orderId, email } = c.req.query();
 
   if (!orderId || !email) {
-    return res.status(400).json({ error: 'Order ID and email are required to check status' });
+    return c.json({ error: 'Order ID and email are required to check status' }, 400);
   }
 
-  const orders = db.get('orders');
   const cleanOrderId = String(orderId).trim().toUpperCase();
   const cleanEmail = String(email).trim().toLowerCase();
 
-  const order = orders.find(
-    (o) => o.id.toUpperCase() === cleanOrderId && o.customer_email.toLowerCase() === cleanEmail
-  );
+  const order = await repo.orders.get(cleanOrderId);
 
-  if (!order) {
-    return res.status(404).json({ error: 'No matching order found for this Order ID and Email.' });
+  if (!order || order.customer_email.toLowerCase() !== cleanEmail) {
+    return c.json({ error: 'No matching order found for this Order ID and Email.' }, 404);
   }
 
-  const product = db.get('products').find((p) => p.id === order.product_id);
-  const accessRecords = db.get('product_access');
-  const access = accessRecords.find((a) => a.order_id === order.id);
+  const product = await repo.products.get(order.product_id);
+  const access = await repo.getAccessForOrder(order.id);
 
   // Default response without protected assets
   const responseData: any = {
@@ -289,7 +282,7 @@ publicRouter.get('/orders/track', (req: Request, res: Response) => {
       responseData.access_granted = false;
       responseData.access_revoked = true;
       responseData.message = 'Access to this product has been revoked by administration.';
-      return res.json(responseData);
+      return c.json(responseData);
     }
 
     // Check expiration
@@ -297,7 +290,7 @@ publicRouter.get('/orders/track', (req: Request, res: Response) => {
       responseData.access_granted = false;
       responseData.access_expired = true;
       responseData.message = 'Product access has expired.';
-      return res.json(responseData);
+      return c.json(responseData);
     }
 
     // Authorization verified! Provide temporary signed download token and digital content
@@ -321,19 +314,19 @@ publicRouter.get('/orders/track', (req: Request, res: Response) => {
     responseData.expires_at = access.expires_at;
   }
 
-  return res.json(responseData);
+  return c.json(responseData);
 });
 
 // Customer portal: list all orders by verified email lookup
-publicRouter.post('/customer/my-orders', (req: Request, res: Response) => {
-  const { email } = req.body;
+publicRouter.post('/customer/my-orders', async (c) => {
+  const { email } = await c.req.json().catch(() => ({} as any));
   if (!email) {
-    return res.status(400).json({ error: 'Email address is required' });
+    return c.json({ error: 'Email address is required' }, 400);
   }
 
   const cleanEmail = String(email).trim().toLowerCase();
-  const orders = db.get('orders').filter((o) => o.customer_email.toLowerCase() === cleanEmail);
-  const accessRecords = db.get('product_access');
+  const orders = (await repo.orders.all()).filter((o) => o.customer_email.toLowerCase() === cleanEmail);
+  const accessRecords = await repo.productAccess.all();
 
   const formatted = orders.map((order) => {
     const access = accessRecords.find((a) => a.order_id === order.id);
@@ -352,82 +345,84 @@ publicRouter.post('/customer/my-orders', (req: Request, res: Response) => {
     };
   });
 
-  return res.json({ orders: formatted });
+  return c.json({ orders: formatted });
 });
 
 // -------------------------------------------------------------
 // 4. SECURE SERVER-SIDE PRODUCT FILE DELIVERY
 // -------------------------------------------------------------
-publicRouter.get('/customer/download-file', (req: Request, res: Response) => {
-  const { token } = req.query;
+publicRouter.get('/customer/download-file', async (c) => {
+  const token = c.req.query('token');
 
   if (!token) {
-    return res.status(403).json({ error: 'Access Denied: Missing cryptographic download token.' });
+    return c.json({ error: 'Access Denied: Missing cryptographic download token.' }, 403);
   }
 
   const payload = verifyDownloadToken(String(token));
   if (!payload) {
-    return res.status(403).json({
-      error: 'Access Denied: Download link has expired or is invalid. Please request a fresh link from your order page.',
-    });
+    return c.json(
+      {
+        error: 'Access Denied: Download link has expired or is invalid. Please request a fresh link from your order page.',
+      },
+      403
+    );
   }
 
   const { orderId, productId, email } = payload;
 
   // 1. Verify order
-  const orders = db.get('orders');
-  const order = orders.find(
-    (o) => o.id === orderId && o.customer_email.toLowerCase() === email.toLowerCase()
-  );
+  const order = await repo.orders.get(orderId);
 
-  if (!order || order.payment_status !== 'VERIFIED') {
-    return res.status(403).json({ error: 'Access Denied: Payment is unverified or invalid.' });
+  if (!order || order.customer_email.toLowerCase() !== email.toLowerCase() || order.payment_status !== 'VERIFIED') {
+    return c.json({ error: 'Access Denied: Payment is unverified or invalid.' }, 403);
   }
 
   // 2. Verify product access record
-  const accessRecords = db.get('product_access');
-  const access = accessRecords.find((a) => a.order_id === order.id);
+  const access = await repo.getAccessForOrder(order.id);
 
   if (!access) {
-    return res.status(403).json({ error: 'Access Denied: No access record exists for this purchase.' });
+    return c.json({ error: 'Access Denied: No access record exists for this purchase.' }, 403);
   }
 
   if (access.revoked_at) {
-    return res.status(403).json({ error: 'Access Denied: Access has been revoked.' });
+    return c.json({ error: 'Access Denied: Access has been revoked.' }, 403);
   }
 
   if (new Date(access.expires_at).getTime() < Date.now()) {
-    return res.status(403).json({ error: 'Access Denied: Access period has expired.' });
+    return c.json({ error: 'Access Denied: Access period has expired.' }, 403);
   }
 
   if (access.download_count >= access.max_downloads) {
-    return res.status(403).json({
-      error: `Access Denied: Maximum download limit (${access.max_downloads} downloads) reached. Contact support for reset.`,
-    });
+    return c.json(
+      {
+        error: `Access Denied: Maximum download limit (${access.max_downloads} downloads) reached. Contact support for reset.`,
+      },
+      403
+    );
   }
 
   // 3. Locate private file
-  const products = db.get('products');
-  const product = products.find((p) => p.id === productId);
+  const product = await repo.products.get(productId);
 
   if (!product || !product.product_file_path) {
-    return res.status(404).json({ error: 'No downloadable asset attached to this product.' });
+    return c.json({ error: 'No downloadable asset attached to this product.' }, 404);
   }
 
-  const filePath = path.join(PRIVATE_FILES_DIR, product.product_file_path);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'Product asset file could not be found on server.' });
+  const file = await readFile('products', product.product_file_path);
+  if (!file) {
+    return c.json({ error: 'Product asset file could not be found on server.' }, 404);
   }
 
   // 4. Increment download count
   access.download_count += 1;
-  db.set('product_access', accessRecords);
+  await repo.productAccess.put(access);
 
-  // 5. Stream file with attachment disposition
-  const downloadFileName = product.product_file_name || path.basename(filePath);
-  res.setHeader('Content-Disposition', `attachment; filename="${downloadFileName}"`);
-  res.setHeader('Content-Type', 'application/octet-stream');
-
-  const fileStream = fs.createReadStream(filePath);
-  fileStream.pipe(res);
+  // 5. Send file with attachment disposition
+  const downloadFileName = (product.product_file_name || product.product_file_path).replace(/"/g, '');
+  return new Response(file.data, {
+    headers: {
+      'Content-Disposition': `attachment; filename="${downloadFileName}"`,
+      'Content-Type': 'application/octet-stream',
+    },
+  });
 });
