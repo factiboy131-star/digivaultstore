@@ -1,0 +1,116 @@
+{
+  "products": [],
+  "categories": [
+    {
+      "id": "cat_1",
+      "name": "AI Prompts",
+      "slug": "ai-prompts",
+      "description": "Elite prompt systems for Google Gemini, Claude, and ChatGPT.",
+      "status": "Active",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    },
+    {
+      "id": "cat_2",
+      "name": "Business",
+      "slug": "business",
+      "description": "Contracts, operating agreements, financial models, and proposals.",
+      "status": "Active",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    },
+    {
+      "id": "cat_3",
+      "name": "Marketing",
+      "slug": "marketing",
+      "description": "Direct response copy formulas, ad templates, and email sequences.",
+      "status": "Active",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    },
+    {
+      "id": "cat_4",
+      "name": "Templates",
+      "slug": "templates",
+      "description": "Ready-to-use documents, spreadsheets, Notion systems, and frameworks.",
+      "status": "Active",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    },
+    {
+      "id": "cat_5",
+      "name": "E-books & Guides",
+      "slug": "ebooks-guides",
+      "description": "Comprehensive guides and actionable industry blueprints.",
+      "status": "Active",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    }
+  ],
+  "orders": [],
+  "product_access": [],
+  "admin_users": [
+    {
+      "id": "admin_1",
+      "email": "factiboy131@gmail.com",
+      "password_hash": "$2b$10$bt3MgTvJxtmGPAFDudYxOumyd7IgIz.4lpc5.SUqYQYxjD.Cf/0ei",
+      "name": "Store Administrator",
+      "role": "superadmin",
+      "created_at": "2026-10-06T09:34:09.743Z"
+    }
+  ],
+  "settings": {
+    "general": {
+      "store_name": "DigiVault",
+      "store_tagline": "Premium Digital Assets, Prompt Vaults & Executive Resources",
+      "store_email": "husnaincreator6@gmail.com",
+      "whatsapp": "+92 371 7028832",
+      "currency": "PKR",
+      "support_hours": "24/7 Priority Digital Support"
+    },
+    "payments": {
+      "easypaisa": {
+        "enabled": true,
+        "account_name": "Ghulam Murtaza",
+        "account_number": "03446730755",
+        "instructions": "1. Open EasyPaisa app or dial *786#\n2. Send the exact product amount to EasyPaisa Account: 03446730755 (Account Name: Ghulam Murtaza)\n3. Take a screenshot of the completed payment receipt\n4. Note down your Transaction ID (TID) from the SMS or app\n5. Enter your TID and upload the screenshot below to verify your order."
+      },
+      "jazzcash": {
+        "enabled": true,
+        "account_name": "Fozia Bibi",
+        "account_number": "03247755484",
+        "instructions": "1. Open JazzCash App or dial *786#\n2. Transfer exact product amount to JazzCash Account: 03247755484 (Account Name: Fozia Bibi)\n3. Save the payment receipt screenshot\n4. Copy the 12-digit Transaction ID (TID)\n5. Submit your details below for instant verification."
+      }
+    },
+    "delivery": {
+      "download_link_expiration_minutes": 15,
+      "max_download_attempts": 10,
+      "access_expiration_days": 365
+    },
+    "email": {
+      "enabled": true,
+      "provider": "System Notification Service",
+      "sender_name": "DigiVault Delivery Team",
+      "sender_email": "delivery@digivault.store"
+    },
+    "homepage": {
+      "hero_badge": "⚡ Verified Instant Digital Delivery",
+      "hero_heading": "Elite Digital Assets Built for High-Impact Execution",
+      "hero_description": "Instant access to rigorously tested Google AI prompt packs, business agreements, marketing blueprints, and digital tools. Paid easily via EasyPaisa and JazzCash.",
+      "hero_cta": "Explore All Digital Vaults",
+      "announcement": "🎉 Special Launch: Save up to 50% on all Prompt Packs this week!",
+      "why_choose_us": [
+        {
+          "title": "100% Verified Manual Payments",
+          "description": "Simple and familiar payment via EasyPaisa or JazzCash with verified order receipts.",
+          "icon": "ShieldCheck"
+        },
+        {
+          "title": "Tamper-Proof Secure Delivery",
+          "description": "Direct server-side cryptographic token downloads and private interactive asset portals.",
+          "icon": "Lock"
+        },
+        {
+          "title": "Immediate Access & Updates",
+          "description": "Online prompt viewer with 1-click copy functionality and downloadable formats.",
+          "icon": "Zap"
+        }
+      ]
+    }
+  }
+}

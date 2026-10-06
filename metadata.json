@@ -1,0 +1,6 @@
+{
+  "name": "DigiVault - Premium Digital Products Store & Secure Admin",
+  "description": "Production-ready digital products e-commerce store with manual EasyPaisa & JazzCash payments, secure admin verification, and tamper-proof digital asset delivery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

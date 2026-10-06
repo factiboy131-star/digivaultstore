@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        try {
+          var origFetch = window.fetch;
+          var curFetch = typeof origFetch === 'function' ? origFetch.bind(window) : origFetch;
+          Object.defineProperty(window, 'fetch', {
+            configurable: true,
+            enumerable: true,
+            get: function() {
+              return curFetch;
+            },
+            set: function(fn) {
+              curFetch = fn;
+            }
+          });
+        } catch (e) {}
+      })();
+    </script>
+    <title>DigiVault - Premium Digital Products Store & Secure Admin</title>
+    <meta name="description" content="Production-ready digital products e-commerce store with manual EasyPaisa & JazzCash payments, secure admin verification, and tamper-proof digital asset delivery." />
+    <meta property="og:title" content="DigiVault - Premium Digital Products Store & Secure Admin" />
+    <meta property="og:description" content="Production-ready digital products e-commerce store with manual EasyPaisa & JazzCash payments, secure admin verification, and tamper-proof digital asset delivery." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
