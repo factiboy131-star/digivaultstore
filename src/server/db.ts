@@ -1,20 +1,9 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
+import { asc, desc, eq } from 'drizzle-orm';
+import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
+import { getStore } from '@netlify/blobs';
 import bcrypt from 'bcryptjs';
-
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const PRIVATE_FILES_DIR = path.resolve(DATA_DIR, 'private_files');
-const PRIVATE_SCREENSHOTS_DIR = path.resolve(DATA_DIR, 'private_screenshots');
-const PUBLIC_UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads', 'images');
-const DB_FILE = path.resolve(DATA_DIR, 'db.json');
-
-// Ensure directories exist
-[DATA_DIR, PRIVATE_FILES_DIR, PRIVATE_SCREENSHOTS_DIR, PUBLIC_UPLOADS_DIR].forEach((dir) => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-});
+import { db as sqlDb } from '../../db/index.js';
+import * as schema from '../../db/schema.js';
 
 export interface FAQItem {
   question: string;
@@ -178,28 +167,26 @@ export interface DatabaseSchema {
 }
 
 // Default initial data
-function getDefaultData(): DatabaseSchema {
-  const adminEmail = process.env.ADMIN_EMAIL || 'factiboy131@gmail.com';
+function getDefaultAdmin(): AdminUser {
+  const adminEmail = Netlify.env.get('ADMIN_EMAIL') || 'factiboy131@gmail.com';
   // Password Mahar131 hashed using bcrypt
   const salt = bcrypt.genSaltSync(10);
   const passwordHash = bcrypt.hashSync('Mahar131', salt);
 
+  return {
+    id: 'admin_1',
+    email: adminEmail,
+    password_hash: passwordHash,
+    name: 'Store Administrator',
+    role: 'superadmin',
+    created_at: new Date().toISOString(),
+  };
+}
+
+function getDefaultData(): Omit<DatabaseSchema, 'admin_users'> {
   const now = new Date().toISOString();
 
-  // Create sample dummy PDF files in private directory so downloads work out of the box
-  createDefaultPrivateFiles();
-
   return {
-    admin_users: [
-      {
-        id: 'admin_1',
-        email: adminEmail,
-        password_hash: passwordHash,
-        name: 'Store Administrator',
-        role: 'superadmin',
-        created_at: now,
-      },
-    ],
     categories: [
       {
         id: 'cat_1',
@@ -309,135 +296,120 @@ function getDefaultData(): DatabaseSchema {
   };
 }
 
-function createDefaultPrivateFiles() {
-  const samplePdfPath = path.join(PRIVATE_FILES_DIR, '50-Google-Pro-Prompts.pdf');
-  if (!fs.existsSync(samplePdfPath)) {
-    const pdfContent = `%PDF-1.4
-%âãÏÓ
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
-endobj
-4 0 obj
-<< /Length 210 >>
-stream
-BT
-/F1 20 Tf
-50 720 Td
-(DIGIVAULT: 50 GOOGLE PRO PROMPTS) Tj
-/F1 12 Tf
-0 -30 Td
-(Official Customer Copy - Licensed to Purchaser) Tj
-0 -25 Td
-(Prompt 01: Multi-Perspective Strategic Architecture System) Tj
-0 -20 Td
-(Prompt 02: High-Leverage Code Refactoring Loop) Tj
-0 -20 Td
-(Prompt 03: Precision Market Opportunity Synthesizer) Tj
-ET
-endstream
-endobj
-5 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
-endobj
-xref
-0 6
-0000000000 65535 f 
-0000000015 00000 n 
-0000000068 00000 n 
-0000000125 00000 n 
-0000000242 00000 n 
-0000000504 00000 n 
-trailer
-<< /Size 6 /Root 1 0 R >>
-startxref
-577
-%%EOF`;
-    fs.writeFileSync(samplePdfPath, pdfContent);
-  }
 
-  const sampleZip1 = path.join(PRIVATE_FILES_DIR, 'Copywriting-Email-Vault.zip');
-  if (!fs.existsSync(sampleZip1)) {
-    fs.writeFileSync(sampleZip1, 'PK\x03\x04DigiVault Copywriting Email Templates Vault Archive');
-  }
+// -------------------------------------------------------------
+// Persistence (Netlify Database for records, Netlify Blobs for files)
+// -------------------------------------------------------------
+type CollectionTable = PgTable & { id: PgColumn; data: PgColumn; createdAt: PgColumn };
 
-  const sampleZip2 = path.join(PRIVATE_FILES_DIR, 'Startup-Legal-Pack.zip');
-  if (!fs.existsSync(sampleZip2)) {
-    fs.writeFileSync(sampleZip2, 'PK\x03\x04DigiVault Startup Legal Templates & Agreements Archive');
-  }
-
-  // Sample private screenshot
-  const sampleScr = path.join(PRIVATE_SCREENSHOTS_DIR, 'sample_screenshot_1.png');
-  if (!fs.existsSync(sampleScr)) {
-    // 1x1 transparent PNG fallback bytes
-    const pngBytes = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-      'base64'
-    );
-    fs.writeFileSync(sampleScr, pngBytes);
-  }
+function collection<T extends { id: string; created_at?: string }>(
+  table: CollectionTable,
+  order: 'asc' | 'desc',
+  extraColumns: (record: T) => Record<string, unknown> = () => ({})
+) {
+  const t = table as any;
+  return {
+    async all(): Promise<T[]> {
+      const rows = await sqlDb
+        .select({ data: t.data })
+        .from(t)
+        .orderBy(order === 'asc' ? asc(t.createdAt) : desc(t.createdAt));
+      return rows.map((r: any) => r.data as T);
+    },
+    async get(id: string): Promise<T | undefined> {
+      const [row] = await sqlDb.select({ data: t.data }).from(t).where(eq(t.id, id)).limit(1);
+      return row ? ((row as any).data as T) : undefined;
+    },
+    async put(record: T): Promise<T> {
+      const values = {
+        id: record.id,
+        data: record,
+        ...extraColumns(record),
+        ...(record.created_at ? { createdAt: new Date(record.created_at) } : {}),
+      };
+      const { id: _id, createdAt: _createdAt, ...updatable } = values as any;
+      await sqlDb.insert(t).values(values).onConflictDoUpdate({ target: t.id, set: updatable });
+      return record;
+    },
+    async remove(id: string): Promise<boolean> {
+      const deleted = await sqlDb.delete(t).where(eq(t.id, id)).returning({ id: t.id });
+      return deleted.length > 0;
+    },
+  };
 }
 
-class Database {
-  private data: DatabaseSchema;
+export const repo = {
+  products: collection<Product>(schema.products as any, 'desc'),
+  categories: collection<Category>(schema.categories as any, 'asc'),
+  orders: collection<Order>(schema.orders as any, 'desc', (o) => ({ customerEmail: o.customer_email })),
+  productAccess: collection<ProductAccess>(schema.productAccess as any, 'asc', (a) => ({ orderId: a.order_id })),
+  adminUsers: collection<AdminUser>(schema.adminUsers as any, 'asc', (a) => ({ email: a.email.toLowerCase() })),
 
-  constructor() {
-    this.data = this.load();
-  }
+  async getAccessForOrder(orderId: string): Promise<ProductAccess | undefined> {
+    const [row] = await sqlDb
+      .select({ data: schema.productAccess.data })
+      .from(schema.productAccess)
+      .where(eq(schema.productAccess.orderId, orderId))
+      .limit(1);
+    return row ? (row.data as ProductAccess) : undefined;
+  },
 
-  private load(): DatabaseSchema {
-    try {
-      if (fs.existsSync(DB_FILE)) {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        // Ensure defaults if missing properties
-        const defaultData = getDefaultData();
-        return {
-          products: parsed.products || defaultData.products,
-          categories: parsed.categories || defaultData.categories,
-          orders: parsed.orders || defaultData.orders,
-          product_access: parsed.product_access || defaultData.product_access,
-          admin_users: parsed.admin_users || defaultData.admin_users,
-          settings: parsed.settings ? { ...defaultData.settings, ...parsed.settings } : defaultData.settings,
-        };
+  async getSettings(): Promise<SiteSettings> {
+    const defaults = getDefaultData().settings;
+    const [row] = await sqlDb.select().from(schema.settings).where(eq(schema.settings.id, 1)).limit(1);
+    return row ? { ...defaults, ...(row.data as SiteSettings) } : defaults;
+  },
+
+  async saveSettings(data: SiteSettings): Promise<void> {
+    await sqlDb
+      .insert(schema.settings)
+      .values({ id: 1, data })
+      .onConflictDoUpdate({ target: schema.settings.id, set: { data } });
+  },
+};
+
+let seeded: Promise<void> | null = null;
+
+// Seeds the default settings, categories and administrator the first time the store runs.
+export function ensureSeeded(): Promise<void> {
+  if (!seeded) {
+    seeded = (async () => {
+      const defaults = getDefaultData();
+      const inserted = await sqlDb
+        .insert(schema.settings)
+        .values({ id: 1, data: defaults.settings })
+        .onConflictDoNothing()
+        .returning({ id: schema.settings.id });
+
+      if (inserted.length > 0) {
+        for (const category of defaults.categories) {
+          await repo.categories.put(category);
+        }
       }
-    } catch (err) {
-      console.error('Error loading database file, initializing defaults:', err);
-    }
 
-    const initial = getDefaultData();
-    this.saveData(initial);
-    return initial;
+      const [anyAdmin] = await sqlDb.select({ id: schema.adminUsers.id }).from(schema.adminUsers).limit(1);
+      if (!anyAdmin) {
+        await repo.adminUsers.put(getDefaultAdmin());
+      }
+    })().catch((err) => {
+      seeded = null;
+      throw err;
+    });
   }
-
-  private saveData(data: DatabaseSchema) {
-    try {
-      const tempPath = `${DB_FILE}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
-      fs.renameSync(tempPath, DB_FILE);
-    } catch (err) {
-      console.error('Failed to write database file:', err);
-    }
-  }
-
-  public get<K extends keyof DatabaseSchema>(key: K): DatabaseSchema[K] {
-    return this.data[key];
-  }
-
-  public set<K extends keyof DatabaseSchema>(key: K, value: DatabaseSchema[K]) {
-    this.data[key] = value;
-    this.saveData(this.data);
-  }
-
-  public save() {
-    this.saveData(this.data);
-  }
+  return seeded;
 }
 
-export const db = new Database();
-export { DATA_DIR, PRIVATE_FILES_DIR, PRIVATE_SCREENSHOTS_DIR, PUBLIC_UPLOADS_DIR };
+// Private and public uploads live in a single blob store, separated by key prefix.
+export type FileArea = 'images' | 'products' | 'screenshots';
+
+function filesStore() {
+  return getStore({ name: 'digivault-files', consistency: 'strong' });
+}
+
+export async function saveFile(area: FileArea, name: string, data: ArrayBuffer, contentType: string) {
+  await filesStore().set(`${area}/${name}`, data, { metadata: { contentType } });
+}
+
+export async function readFile(area: FileArea, name: string) {
+  return filesStore().getWithMetadata(`${area}/${name}`, { type: 'arrayBuffer' });
+}

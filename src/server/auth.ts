@@ -1,14 +1,18 @@
 import jwt from 'jsonwebtoken';
-import { Request, Response, NextFunction } from 'express';
-import { db } from './db.js';
+import { createMiddleware } from 'hono/factory';
+import { repo } from './db.js';
 
-const JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'digivault_production_secure_secret_key_2026_99482';
+function jwtSecret(): string {
+  return Netlify.env.get('ADMIN_JWT_SECRET') || 'digivault_production_secure_secret_key_2026_99482';
+}
 
 export interface AdminPayload {
   adminId: string;
   email: string;
   role: string;
 }
+
+export type AdminEnv = { Variables: { admin: AdminPayload } };
 
 export function signAdminToken(admin: { id: string; email: string; role: string }): string {
   return jwt.sign(
@@ -17,45 +21,40 @@ export function signAdminToken(admin: { id: string; email: string; role: string 
       email: admin.email,
       role: admin.role,
     },
-    JWT_SECRET,
+    jwtSecret(),
     { expiresIn: '7d' }
   );
 }
 
 export function verifyAdminToken(token: string): AdminPayload | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as AdminPayload;
+    return jwt.verify(token, jwtSecret()) as AdminPayload;
   } catch (err) {
     return null;
   }
 }
 
-export interface AuthenticatedRequest extends Request {
-  admin?: AdminPayload;
-}
-
-export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization;
+export const requireAdmin = createMiddleware<AdminEnv>(async (c, next) => {
+  const authHeader = c.req.header('authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Admin authentication token required' });
+    return c.json({ error: 'Unauthorized: Admin authentication token required' }, 401);
   }
 
   const token = authHeader.split(' ')[1];
   const payload = verifyAdminToken(token);
 
   if (!payload) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid or expired admin token' });
+    return c.json({ error: 'Unauthorized: Invalid or expired admin token' }, 401);
   }
 
-  const admins = db.get('admin_users');
-  const user = admins.find((a) => a.id === payload.adminId);
+  const user = await repo.adminUsers.get(payload.adminId);
   if (!user) {
-    return res.status(401).json({ error: 'Unauthorized: Admin user no longer exists' });
+    return c.json({ error: 'Unauthorized: Admin user no longer exists' }, 401);
   }
 
-  req.admin = payload;
-  next();
-}
+  c.set('admin', payload);
+  await next();
+});
 
 // Generates a short-lived download token (signed JWT) for verified customer downloads
 export function signDownloadToken(orderId: string, productId: string, email: string): string {
@@ -66,14 +65,14 @@ export function signDownloadToken(orderId: string, productId: string, email: str
       email,
       type: 'download',
     },
-    JWT_SECRET,
+    jwtSecret(),
     { expiresIn: '15m' }
   );
 }
 
 export function verifyDownloadToken(token: string): { orderId: string; productId: string; email: string } | null {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, jwtSecret()) as any;
     if (decoded && decoded.type === 'download') {
       return decoded;
     }
